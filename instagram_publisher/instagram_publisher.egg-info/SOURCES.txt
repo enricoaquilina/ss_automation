@@ -1,0 +1,6 @@
+setup.py
+instagram_publisher.egg-info/PKG-INFO
+instagram_publisher.egg-info/SOURCES.txt
+instagram_publisher.egg-info/dependency_links.txt
+instagram_publisher.egg-info/requires.txt
+instagram_publisher.egg-info/top_level.txt

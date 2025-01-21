@@ -1,0 +1,14 @@
+*.pyc
+__pycache__/
+.env
+.DS_Store
+venv/
+*.log
+/data/
+/tmp/
+/log/
+/logs/
+/backups/
+/lost+found/
+*.jpg
+*.png
