@@ -1,8 +1,36 @@
 """
-Image Generator Providers Module
+Image generation providers package.
 
-This module provides provider implementations for image generation services
-like Midjourney and other potential providers.
+This package contains implementations for various AI image generation services
+that can be used as alternatives or backups to each other.
 """
 
-# This is an __init__.py file for the providers package. 
+from .base import (
+    BaseImageProvider,
+    UpscaleProvider, 
+    VariationProvider,
+    ProviderResult,
+    ProviderType,
+    ProviderCapabilities,
+    GenerationStatus,
+    ProviderError,
+    ProviderAuthError,
+    ProviderQuotaError,
+    ProviderModerationError,
+    ProviderTimeoutError
+)
+
+__all__ = [
+    "BaseImageProvider",
+    "UpscaleProvider",
+    "VariationProvider", 
+    "ProviderResult",
+    "ProviderType",
+    "ProviderCapabilities",
+    "GenerationStatus",
+    "ProviderError",
+    "ProviderAuthError",
+    "ProviderQuotaError",
+    "ProviderModerationError",
+    "ProviderTimeoutError"
+] 

@@ -1,0 +1,40 @@
+{
+  "providers": {
+    "replicate": {
+      "api_token": "your_replicate_api_token_here",
+      "default_model": "flux_dev",
+      "preferred_models": ["flux_dev", "sdxl", "playground_v2"],
+      "max_retries": 3,
+      "timeout": 300
+    },
+    "midjourney": {
+      "user_token": "your_discord_user_token",
+      "bot_token": "your_discord_bot_token", 
+      "channel_id": "your_discord_channel_id",
+      "guild_id": "your_discord_guild_id"
+    }
+  },
+  "storage": {
+    "mongodb_uri": "mongodb://your_raspberry_pi_ip:27017/",
+    "db_name": "silicon_sentiments"
+  },
+  "generation": {
+    "default_strategy": "brand_optimized",
+    "max_concurrent_generations": 3,
+    "max_cost_per_generation": 0.10,
+    "timeout": 300
+  },
+  "brand_settings": {
+    "preferred_dimensions": {
+      "width": 1024,
+      "height": 1024
+    },
+    "style_prompts": {
+      "siliconsentiments_style": "digital art, modern, clean aesthetic, tech-inspired",
+      "instagram_optimized": "vibrant colors, high contrast, visually striking"
+    },
+    "negative_prompts": [
+      "blurry", "low quality", "distorted", "text", "watermark"
+    ]
+  }
+}
