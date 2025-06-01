@@ -1,0 +1,1681 @@
+"""
+Discord-Midjourney Client
+
+This module provides client classes for interacting with Discord and Midjourney.
+It implements a hybrid approach:
+- User token for commands and button interactions
+- Bot token for message monitoring and WebSocket events
+"""
+
+import asyncio
+import json
+import logging
+import re
+import time
+import aiohttp
+import requests
+from typing import Dict, Any, Optional, List, Tuple, Set
+from datetime import datetime
+from requests import RequestException
+
+from .models import GenerationResult, UpscaleResult
+from .utils import (MIDJOURNEY_APP_ID, DISCORD_API_URL, GATEWAY_URL, 
+                   RateLimiter, MidjourneyError, PreModerationError, 
+                   PostModerationError, EphemeralModerationError,
+                   InvalidRequestError, QueueFullError, JobQueuedError,
+                   is_pre_moderation, is_post_moderation, is_ephemeral_moderation)
+
+# Configure logging
+logger = logging.getLogger("midjourney_client")
+
+
+class DiscordGateway:
+    """Class to handle Discord gateway connections and event handling"""
+    
+    def __init__(self, token: str, is_bot: bool = False, intents: int = 513):
+        """
+        Initialize with token and intents
+        
+        Args:
+            token: Discord token
+            is_bot: Whether this is a bot token
+            intents: Gateway intents to use
+        """
+        self.token = token
+        self.is_bot = is_bot
+        self.intents = intents
+        self.websocket = None
+        self.session_id = None
+        self.heartbeat_interval = None
+        self.heartbeat_task = None
+        self.sequence = None
+        self.connected = asyncio.Event()
+        self.message_handlers = []
+        self._closed = False
+        self.session = None  # Store the session
+    
+    async def connect(self) -> bool:
+        """
+        Connect to the Discord Gateway
+        
+        Returns:
+            bool: True if connection was successful, False otherwise
+        """
+        if self._closed:
+            self._closed = False
+            
+        if self.websocket:
+            await self.close()
+            
+        try:
+            # Create a single shared session for the lifetime of this gateway
+            self.session = aiohttp.ClientSession()
+            self.websocket = await self.session.ws_connect(GATEWAY_URL)
+            logger.info(f"Gateway connected with {'bot' if self.is_bot else 'user'} token")
+            
+            # Handle the HELLO message
+            msg = await self.websocket.receive_json()
+            if msg.get('op') != 10:  # HELLO
+                logger.error(f"Expected HELLO, got: {msg}")
+                await self.close()
+                return False
+            
+            self.heartbeat_interval = msg['d']['heartbeat_interval'] / 1000
+            logger.debug(f"Heartbeat interval: {self.heartbeat_interval} seconds")
+            
+            # Send identify
+            token_type = "Bot " if self.is_bot else ""
+            await self.websocket.send_json({
+                "op": 2,  # IDENTIFY
+                "d": {
+                    "token": f"{token_type}{self.token}",
+                    "properties": {
+                        "$os": "linux",
+                        "$browser": "discord_client",
+                        "$device": "discord_client"
+                    },
+                    "intents": self.intents
+                }
+            })
+            
+            # Start heartbeat
+            self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            
+            # Wait for READY event
+            ready_future = asyncio.Future()
+            
+            async def handle_ready(data):
+                if data.get('t') == 'READY':
+                    self.session_id = data['d']['session_id']
+                    logger.info(f"Got session ID: {self.session_id}")
+                    ready_future.set_result(True)
+                    self.connected.set()
+                    return True
+                return False
+            
+            self.message_handlers.append(handle_ready)
+            
+            # Start event processing task
+            listener_task = asyncio.create_task(self._event_listener())
+            
+            try:
+                await asyncio.wait_for(ready_future, timeout=15)
+                return True
+            except asyncio.TimeoutError:
+                logger.error("Timed out waiting for READY event")
+                await self.close()
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error connecting to gateway: {e}")
+            await self.close()
+            return False
+    
+    async def _heartbeat_loop(self):
+        """Send heartbeats at regular intervals"""
+        try:
+            while not self._closed and self.websocket and not self.websocket.closed:
+                await self.websocket.send_json({
+                    "op": 1,  # HEARTBEAT
+                    "d": self.sequence
+                })
+                logger.debug(f"Sent heartbeat with sequence: {self.sequence}")
+                await asyncio.sleep(self.heartbeat_interval)
+        except asyncio.CancelledError:
+            logger.debug("Heartbeat task cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Error in heartbeat loop: {e}")
+            if not self._closed:
+                await self.close()
+                asyncio.create_task(self.connect())
+    
+    async def _event_listener(self):
+        """Listen for events and dispatch to handlers"""
+        try:
+            while not self._closed and self.websocket and not self.websocket.closed:
+                try:
+                    msg = await self.websocket.receive()
+                    
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        
+                        # Update sequence for heartbeats
+                        if data.get('s') is not None:
+                            self.sequence = data['s']
+                        
+                        # Handle different message types
+                        op = data.get('op')
+                        
+                        if op == 0:  # DISPATCH
+                            await self._handle_dispatch(data)
+                        elif op == 7:  # RECONNECT
+                            logger.warning("Received RECONNECT, reconnecting...")
+                            await self.close()
+                            asyncio.create_task(self.connect())
+                            break
+                        elif op == 9:  # INVALID SESSION
+                            logger.warning("Received INVALID SESSION, reconnecting...")
+                            await self.close()
+                            await asyncio.sleep(5)  # Wait before reconnecting
+                            asyncio.create_task(self.connect())
+                            break
+                        elif op == 11:  # HEARTBEAT ACK
+                            logger.debug("Received HEARTBEAT ACK")
+                    
+                    elif msg.type == aiohttp.WSMsgType.CLOSED:
+                        logger.warning("WebSocket closed, reconnecting...")
+                        await self.close()
+                        asyncio.create_task(self.connect())
+                        break
+                        
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        logger.error(f"WebSocket error: {msg.data}")
+                        await self.close()
+                        asyncio.create_task(self.connect())
+                        break
+                    
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}")
+        except asyncio.CancelledError:
+            logger.debug("Event listener task cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Error in event listener: {e}")
+            if not self._closed:
+                await self.close()
+                asyncio.create_task(self.connect())
+    
+    async def _handle_dispatch(self, data):
+        """Handle dispatch events and pass to registered handlers"""
+        for handler in list(self.message_handlers):
+            try:
+                if await handler(data):
+                    # If handler returns True, remove it from the list
+                    # (it's typically a one-time event handler)
+                    if handler in self.message_handlers:
+                        self.message_handlers.remove(handler)
+            except Exception as e:
+                logger.error(f"Error in message handler: {e}")
+    
+    async def close(self):
+        """Close the connection and cleanup tasks"""
+        self._closed = True
+        
+        # Cancel heartbeat task
+        if self.heartbeat_task and not self.heartbeat_task.done():
+            self.heartbeat_task.cancel()
+            try:
+                await self.heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Error cancelling heartbeat task: {e}")
+            finally:
+                self.heartbeat_task = None
+        
+        # Close WebSocket
+        if self.websocket and not self.websocket.closed:
+            try:
+                await self.websocket.close()
+            except Exception as e:
+                logger.error(f"Error closing websocket: {e}")
+        self.websocket = None
+        
+        # Close the session
+        if self.session and not self.session.closed:
+            try:
+                await self.session.close()
+            except Exception as e:
+                logger.error(f"Error closing session: {e}")
+        self.session = None
+        
+        self.sequence = None
+        self.connected.clear()
+        logger.debug("Gateway connection closed")
+    
+    def register_handler(self, handler):
+        """
+        Register a message handler function
+        
+        Args:
+            handler: Function that takes a gateway message and returns a boolean
+        """
+        self.message_handlers.append(handler)
+    
+    def unregister_handler(self, handler):
+        """
+        Unregister a message handler function
+        
+        Args:
+            handler: Previous registered handler function
+        """
+        if handler in self.message_handlers:
+            self.message_handlers.remove(handler)
+
+
+class MidjourneyClient:
+    """Client for interacting with Midjourney through Discord"""
+    
+    def __init__(self, user_token: str, bot_token: str, channel_id: str, guild_id: str):
+        """
+        Initialize the client with tokens and IDs
+        
+        Args:
+            user_token: Discord user token for sending commands and interactions
+            bot_token: Discord bot token for monitoring messages and WebSocket events
+            channel_id: ID of the Discord channel where Midjourney is active
+            guild_id: ID of the Discord guild/server
+        """
+        # Clean up tokens in case they have extra whitespace
+        self.user_token = user_token.strip() if user_token else ""
+        self.bot_token = bot_token.strip() if bot_token else ""
+        self.channel_id = channel_id
+        self.guild_id = guild_id
+        
+        # Create gateway connections for both tokens
+        self.user_gateway = DiscordGateway(self.user_token, is_bot=False, intents=513)
+        self.bot_gateway = DiscordGateway(self.bot_token, is_bot=True, intents=33281)
+        
+        # Operation tracking
+        self.last_interaction_time = 0
+        self.current_generation_prompt = None
+        self.current_upscale_variant = None
+        self.seen_message_ids = set()
+        
+        # Event futures
+        self.generation_future = None
+        self.upscale_futures = {}
+        
+        # For tracking matched messages
+        self.matched_message_ids = set()
+        
+        # Add rate limiter
+        self.rate_limiter = RateLimiter(base_delay=0.35)
+        
+        # Generation tracking
+        self.before_message_id = None
+        self.waiting_message_id = None
+        self.waiting_start_time = 0
+        
+        # Prepare headers for API requests - ensure correct format for Discord API
+        # For user token, it should be sent without a prefix
+        self.headers = {
+            "Authorization": self.user_token,
+            "Content-Type": "application/json",
+            "User-Agent": "Discord Integration/1.0"
+        }
+        
+        # For bot token, it must have the "Bot " prefix
+        self.bot_headers = {
+            "Authorization": f"Bot {self.bot_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "Discord Integration/1.0"
+        }
+        
+        # For diagnostic purposes
+        logger.debug(f"Client initialized for channel {channel_id} in guild {guild_id}")
+    
+    async def initialize(self) -> bool:
+        """
+        Initialize connections to Discord
+        
+        Returns:
+            bool: True if initialization was successful, False otherwise
+        """
+        try:
+            # Connect with user token
+            user_success = await self.user_gateway.connect()
+            if not user_success:
+                logger.error("Failed to connect with user token")
+                return False
+            
+            # Connect with bot token
+            bot_success = await self.bot_gateway.connect()
+            if not bot_success:
+                logger.error("Failed to connect with bot token")
+                await self.user_gateway.close()
+                return False
+            
+            # Register bot message handler
+            self.bot_gateway.register_handler(self._handle_bot_message)
+            
+            logger.info(f"Initialized MidjourneyClient with session ID: {self.user_gateway.session_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error initializing client: {e}")
+            await self.close()
+            return False
+    
+    async def _handle_bot_message(self, data):
+        """
+        Handle messages received by the bot gateway
+        
+        Args:
+            data: Gateway message data
+            
+        Returns:
+            bool: True if the handler should be removed, False otherwise
+        """
+        if data.get('t') == 'MESSAGE_CREATE':
+            message = data['d']
+            
+            # Check if the message is from our channel
+            if message.get('channel_id') != self.channel_id:
+                return False
+                
+            # Check if it's from Midjourney
+            author = message.get('author', {})
+            if author.get('id') != MIDJOURNEY_APP_ID:
+                return False
+                
+            # Get message details
+            message_id = message.get('id')
+            content = message.get('content', '')
+            attachments = message.get('attachments', [])
+            components = message.get('components', [])
+            
+            # Skip if we've already seen this message or if it's been matched to a variant
+            if message_id in self.seen_message_ids or message_id in self.matched_message_ids:
+                return False
+                
+            # Add to seen messages
+            self.seen_message_ids.add(message_id)
+            
+            # Enhanced logging for debugging
+            logger.debug(f"Received Midjourney message: {content[:100]}")
+            logger.debug(f"Message has {len(attachments)} attachments and {len(components)} component rows")
+            
+            # Check for generation completion
+            if self.generation_future and not self.generation_future.done():
+                # Check if this is a grid with upscale buttons
+                has_upscale_buttons = False
+                for row in components:
+                    for component in row.get('components', []):
+                        if component.get('type') == 2 and component.get('label', '').startswith('U'):
+                            has_upscale_buttons = True
+                            break
+                    if has_upscale_buttons:
+                        break
+                
+                if has_upscale_buttons and attachments:
+                    image_url = attachments[0].get('url')
+                    if image_url:
+                        # Fix image URL to get uncompressed version
+                        image_url = image_url.replace('media.discordapp.net', 'cdn.discordapp.com')
+                        
+                        logger.info(f"Found generation result: {message_id}")
+                        self.generation_future.set_result({
+                            'message_id': message_id,
+                            'image_url': image_url
+                        })
+                        return True
+            
+            # Check for upscale completion with more permissive detection
+            if self.current_upscale_variant is not None and self.upscale_futures:
+                variant = self.current_upscale_variant
+                future = self.upscale_futures.get(variant)
+                
+                if future and not future.done() and attachments:
+                    is_upscale = False
+                    variant_label = f"U{variant}"
+                    
+                    # Improved upscale detection with more pattern matching
+                    is_upscale = any([
+                        # Explicit variant references
+                        f"Image #{variant}" in content,
+                        f"Upscale: {variant_label}" in content,
+                        f"variant {variant}" in content.lower(),
+                        f"upscaling #{variant}" in content.lower(),
+                        
+                        # More general patterns that could indicate upscale
+                        "upscaled" in content.lower() and not any(f"#{other}" in content for other in range(1, 5) if other != variant),
+                        
+                        # Time-based heuristic - assume it's our upscale if it follows shortly after our interaction
+                        attachments and len(attachments) == 1 and self._is_recent_interaction(message)
+                    ])
+                    
+                    if is_upscale:
+                        image_url = attachments[0].get('url')
+                        if image_url:
+                            # Fix image URL to get uncompressed version
+                            image_url = image_url.replace('media.discordapp.net', 'cdn.discordapp.com')
+                            
+                            logger.info(f"Found upscale result for U{variant}: {image_url[:60]}...")
+                            
+                            # Mark this message as matched to this variant
+                            self.matched_message_ids.add(message_id)
+                            
+                            future.set_result(image_url)
+                            return True
+            
+            return False
+    
+    def _is_recent_interaction(self, message):
+        """
+        Check if a message appears to follow our recent interaction
+        
+        Args:
+            message: Discord message data
+            
+        Returns:
+            bool: True if message is recent, False otherwise
+        """
+        try:
+            # Parse ISO timestamp if available
+            timestamp = message.get('timestamp')
+            if timestamp:
+                message_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp()
+                time_diff = abs(message_time - self.last_interaction_time)
+                
+                # If within 30 seconds of our interaction, it's likely related
+                return time_diff < 30
+        except Exception as e:
+            logger.warning(f"Error parsing timestamp: {e}")
+        
+        # Default case - can't determine
+        return False
+    
+    async def generate_image(self, prompt: str) -> GenerationResult:
+        """
+        Generate an image using Midjourney's /imagine command
+        
+        Args:
+            prompt: The prompt to send to Midjourney
+            
+        Returns:
+            GenerationResult: The result of the generation
+            
+        Raises:
+            MidjourneyError: If the generation fails
+        """
+        logger.info(f"Generating image with prompt: {prompt}")
+        
+        try:
+            # Store the prompt
+            self.current_generation_prompt = prompt
+            
+            # Create a future for the generation result
+            self.generation_future = asyncio.Future()
+            
+            # Clear seen message IDs for this generation
+            self.seen_message_ids.clear()
+            
+            # Following UseAPI documentation strategy:
+            # Step 1: Get the id of the most recent message before sending command
+            before_messages = await self._get_recent_messages(limit=1)
+            self.before_message_id = before_messages[0]['id'] if before_messages else None
+            logger.info(f"Most recent message ID before command: {self.before_message_id}")
+            
+            # Step 2: Send the /imagine command
+            if not await self._send_imagine_command(prompt):
+                self.generation_future = None
+                return GenerationResult(success=False, error="Failed to send /imagine command")
+            
+            # Record when we started waiting
+            self.waiting_start_time = time.time()
+            self.waiting_message_id = None
+            
+            # Step 3: Monitor channel messages to detect the various scenarios
+            # We'll use a combined approach with both websocket and REST API
+            try:
+                # Main monitoring loop - continues until detection or timeout
+                max_wait_time = 600  # 10 minute timeout
+                found_waiting_message = False
+                completed_generation = False
+                
+                while time.time() - self.waiting_start_time < max_wait_time:
+                    # Check for events via the websocket (instant detection)
+                    try:
+                        # Check if the future has been completed by the websocket handler
+                        if self.generation_future.done():
+                            result = await self.generation_future
+                            logger.info(f"Generation detected via websocket: {result['message_id']}")
+                            return GenerationResult(
+                                success=True,
+                                grid_message_id=result['message_id'],
+                                image_url=result['image_url']
+                            )
+                    except asyncio.TimeoutError:
+                        # This is just for the small wait, not fatal
+                        pass
+                    
+                    # Check the channel messages via REST API (slower but more reliable)
+                    current_messages = await self._get_recent_messages(limit=10)
+                    
+                    # Check for waiting message if we haven't found it yet
+                    if not found_waiting_message:
+                        # Look for the initial "Waiting to start" message
+                        for msg in current_messages:
+                            if prompt in msg.get('content', '') and '(Waiting to start)' in msg.get('content', ''):
+                                self.waiting_message_id = msg['id']
+                                found_waiting_message = True
+                                logger.info(f"Found waiting message: {self.waiting_message_id}")
+                                break
+                    
+                    # Check for completed generation if we've found the waiting message
+                    if found_waiting_message:
+                        # Look for completed grid with buttons
+                        for msg in current_messages:
+                            if (prompt in msg.get('content', '') and 
+                                msg.get('attachments') and 
+                                msg.get('components')):
+                                
+                                grid_message_id = msg['id']
+                                image_url = msg['attachments'][0]['url'].replace('media.discordapp.net', 'cdn.discordapp.com')
+                                
+                                logger.info(f"Generation complete via polling: {grid_message_id}")
+                                completed_generation = True
+                                
+                                return GenerationResult(
+                                    success=True,
+                                    grid_message_id=grid_message_id,
+                                    image_url=image_url
+                                )
+                    
+                    # Check for various error conditions
+                    
+                    # Check for pre-moderation (no new message after 30+ seconds)
+                    wait_time = time.time() - self.waiting_start_time
+                    if is_pre_moderation(self.before_message_id, current_messages, wait_time):
+                        logger.warning("Pre-moderation detected - prompt was filtered")
+                        raise PreModerationError("Prompt was filtered by Midjourney's pre-moderation")
+                    
+                    # Check for post-moderation (generation stopped)
+                    if self.waiting_message_id:
+                        for msg in current_messages:
+                            if msg['id'] == self.waiting_message_id and is_post_moderation(msg):
+                                logger.warning(f"Post-moderation detected: {msg.get('content')}")
+                                raise PostModerationError(msg['id'], msg.get('content'))
+                    
+                    # Check for ephemeral moderation (message deleted)
+                    if self.waiting_message_id and is_ephemeral_moderation(self.waiting_message_id, current_messages):
+                        logger.warning("Ephemeral moderation detected - message was deleted")
+                        raise EphemeralModerationError("Message was deleted by Midjourney's moderation system")
+                    
+                    # Check for queued job (special waiting message)
+                    if self.waiting_message_id:
+                        for msg in current_messages:
+                            if msg['id'] == self.waiting_message_id and "(Queued)" in msg.get('content', ''):
+                                logger.warning("Job queued - waiting in line")
+                                raise JobQueuedError(msg['id'])
+                    
+                    # Wait a bit before checking again
+                    # Use shorter interval initially, then longer intervals
+                    if time.time() - self.waiting_start_time < 60:
+                        await asyncio.sleep(5)  # Check every 5 seconds for the first minute
+                    else:
+                        await asyncio.sleep(20)  # Then every 20 seconds afterward
+                
+                # If we get here, we've timed out
+                logger.error("Timed out waiting for generation")
+                raise MidjourneyError("Generation timed out after 10 minutes")
+                
+            except asyncio.TimeoutError:
+                logger.warning("Timed out waiting for WebSocket event, trying REST API fallback")
+                grid_message_id, image_url = await self._fallback_get_generation_result()
+                
+                if grid_message_id:
+                    logger.info(f"Fallback found generation: {grid_message_id}")
+                    return GenerationResult(
+                        success=True,
+                        grid_message_id=grid_message_id,
+                        image_url=image_url
+                    )
+                else:
+                    return GenerationResult(success=False, error="Generation timed out")
+        except MidjourneyError as e:
+            # Pass through our custom errors with proper error message
+            return GenerationResult(success=False, error=str(e))
+        except Exception as e:
+            logger.error(f"Error generating image: {e}")
+            return GenerationResult(success=False, error=str(e))
+        finally:
+            # Clear resources
+            self.generation_future = None
+            self.current_generation_prompt = None
+    
+    async def _fallback_get_generation_result(self) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Fallback method to get generation result using REST API
+        
+        Returns:
+            Tuple[Optional[str], Optional[str]]: Grid message ID and image URL, or None if not found
+        """
+        url = f"{DISCORD_API_URL}/channels/{self.channel_id}/messages?limit=20"
+        
+        try:
+            # Use synchronous requests which is more reliable
+            response = requests.get(url, headers=self.bot_headers)
+            
+            if response.status_code == 200:
+                messages = response.json()
+                
+                for msg in messages:
+                    # Look for Midjourney messages
+                    author = msg.get("author", {})
+                    if author.get("id") == MIDJOURNEY_APP_ID:
+                        content = msg.get("content", "")
+                        
+                        # Look for our prompt or a match to what we're generating
+                        if self.current_generation_prompt:
+                            prompt_words = self.current_generation_prompt.lower().split()
+                            content_lower = content.lower()
+                            
+                            # Check if at least 3 words from our prompt appear in the content
+                            matches = sum(1 for word in prompt_words if word in content_lower and len(word) > 3)
+                            if matches >= min(3, len(prompt_words)):
+                                # Check for components (buttons)
+                                components = msg.get("components", [])
+                                has_upscale_buttons = False
+                                
+                                for row in components:
+                                    for component in row.get("components", []):
+                                        if component.get("type") == 2 and component.get("label", "").startswith("U"):
+                                            has_upscale_buttons = True
+                                            break
+                                    if has_upscale_buttons:
+                                        break
+                                
+                                if has_upscale_buttons:
+                                    grid_message_id = msg.get("id")
+                                    
+                                    # Get image URL
+                                    attachments = msg.get("attachments", [])
+                                    if attachments:
+                                        image_url = attachments[0].get("url")
+                                        # Fix image URL to get uncompressed version
+                                        if image_url:
+                                            image_url = image_url.replace('media.discordapp.net', 'cdn.discordapp.com')
+                                            return grid_message_id, image_url
+            else:
+                logger.error(f"Failed to get messages: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Error in fallback generation check: {e}")
+        
+        return None, None
+
+    async def _get_recent_messages(self, limit=25, before=None, after=None):
+        """
+        Get recent messages from the channel with rate limiting
+        
+        Args:
+            limit: Maximum number of messages to retrieve (default: 25)
+            before: Message ID to get messages before (for pagination)
+            after: Message ID to get messages after (for pagination)
+            
+        Returns:
+            List of message data from Discord API
+            
+        Raises:
+            MidjourneyError on API errors
+        """
+        # Build query parameters
+        params = {'limit': min(limit, 100)}  # Discord maximum is 100
+        if before:
+            params['before'] = before
+        if after:
+            params['after'] = after
+            
+        url = f"{DISCORD_API_URL}/channels/{self.channel_id}/messages"
+        endpoint = f"channels/{self.channel_id}/messages"
+        
+        try:
+            # Define the request function for the rate limiter
+            async def send_request():
+                # Apply rate limiting
+                await self.rate_limiter.wait(endpoint)
+                
+                # Make the request
+                response = requests.get(url, headers=self.bot_headers, params=params)
+                
+                # Update rate limit information from headers
+                if 'X-RateLimit-Remaining' in response.headers:
+                    self.rate_limiter.update_rate_limits(endpoint, response.headers)
+                    
+                return response
+                
+            # Send the request with retry logic
+            response = await self.rate_limiter.with_retry(
+                send_request,
+                max_retries=3,
+                retry_status_codes=[429, 500, 502, 503, 504]
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"Failed to get messages: {response.status_code} - {response.text}")
+                
+                if response.status_code == 403:
+                    raise MidjourneyError(f"Permission denied: {response.text}")
+                elif response.status_code == 404:
+                    raise MidjourneyError(f"Channel not found: {response.text}")
+                else:
+                    raise MidjourneyError(f"API error: {response.status_code} - {response.text}")
+                    
+        except RequestException as e:
+            logger.error(f"Error getting messages: {e}")
+            raise MidjourneyError(f"Network error: {str(e)}")
+            
+        return []
+
+    async def _send_button_interaction(self, message_id: str, custom_id: str) -> bool:
+        """
+        Send button interaction using user token and session ID
+        
+        Args:
+            message_id: The message ID containing the button
+            custom_id: The custom ID of the button to click
+            
+        Returns:
+            bool: True if interaction was sent successfully, False otherwise
+            
+        Raises:
+            MidjourneyError: On API or connection errors
+        """
+        if not self.user_gateway.session_id:
+            logger.error("No session ID available, cannot send interaction")
+            raise InvalidRequestError("No session ID available")
+        
+        # Make sure user gateway is connected
+        if not self.user_gateway.connected.is_set():
+            logger.warning("User gateway not connected, reconnecting...")
+            if not await self.user_gateway.connect():
+                raise MidjourneyError("Failed to connect to user gateway")
+        
+        payload = {
+            "type": 3,  # BUTTON click
+            "guild_id": self.guild_id,
+            "channel_id": self.channel_id,
+            "message_id": message_id,
+            "application_id": MIDJOURNEY_APP_ID,
+            "session_id": self.user_gateway.session_id,
+            "data": {
+                "component_type": 2,  # BUTTON
+                "custom_id": custom_id
+            }
+        }
+        
+        url = f"{DISCORD_API_URL}/interactions"
+        endpoint = "interactions"
+        
+        try:
+            # Define the request function for the rate limiter
+            async def send_request():
+                # Apply rate limiting
+                await self.rate_limiter.wait(endpoint)
+                
+                # Make the request
+                response = requests.post(url, headers=self.headers, json=payload)
+                
+                # Update rate limit information
+                if 'X-RateLimit-Remaining' in response.headers:
+                    self.rate_limiter.update_rate_limits(endpoint, response.headers)
+                    
+                return response
+            
+            # Send the request with retry logic
+            response = await self.rate_limiter.with_retry(
+                send_request,
+                max_retries=3,
+                retry_status_codes=[429, 500, 502, 503, 504]
+            )
+            
+            if response.status_code == 204:  # Success response for interactions
+                logger.info(f"Successfully sent button interaction with custom_id: {custom_id}")
+                # Store the timestamp when the request was sent for later use
+                self.last_interaction_time = time.time()
+                return True
+            else:
+                error_text = response.text
+                logger.error(f"Failed to send button interaction: {response.status_code} - {error_text}")
+                
+                if response.status_code == 404:
+                    raise MidjourneyError(f"Button not found: {error_text}")
+                elif response.status_code == 403:
+                    raise MidjourneyError(f"Permission denied: {error_text}")
+                else:
+                    raise MidjourneyError(f"Failed to send button interaction: {response.status_code} - {error_text}")
+        except RequestException as e:
+            logger.error(f"Error sending button interaction: {e}")
+            raise MidjourneyError(f"Network error sending button interaction: {str(e)}")
+        
+        return False
+
+    async def upscale_variant(self, grid_message_id: str, variant: int) -> UpscaleResult:
+        """
+        Upscale a single variant from a grid
+        
+        Args:
+            grid_message_id: The message ID of the grid to upscale
+            variant: The variant number to upscale (1-4)
+            
+        Returns:
+            UpscaleResult: Result of the upscale operation
+            
+        Raises:
+            MidjourneyError: On errors affecting the upscale
+        """
+        # Validate variant input
+        if variant < 1 or variant > 4:
+            return UpscaleResult(
+                success=False,
+                variant=variant,
+                error="Invalid variant number. Must be between 1 and 4."
+            )
+        
+        # Make sure we're connected to bot gateway
+        if not self.bot_gateway.connected.is_set():
+            logger.warning("Bot gateway not connected, reconnecting...")
+            if not await self.bot_gateway.connect():
+                error_msg = "Failed to connect bot gateway"
+                return UpscaleResult(success=False, variant=variant, error=error_msg)
+        
+        # Get message details using bot token
+        try:
+            message_data = await self._get_message_details(grid_message_id)
+            if not message_data:
+                error_msg = "Failed to get message details for grid"
+                return UpscaleResult(success=False, variant=variant, error=error_msg)
+        except MidjourneyError as e:
+            return UpscaleResult(success=False, variant=variant, error=str(e))
+        
+        # Extract button custom_id
+        try:
+            custom_id = await self._extract_button_custom_id(message_data, variant)
+            if not custom_id:
+                error_msg = f"Failed to extract button U{variant} custom_id"
+                return UpscaleResult(success=False, variant=variant, error=error_msg)
+        except Exception as e:
+            logger.error(f"Error extracting button U{variant}: {e}")
+            return UpscaleResult(success=False, variant=variant, error=f"Error extracting button: {str(e)}")
+        
+        # Track which variant we're currently upscaling
+        self.current_upscale_variant = variant
+        
+        # Store the timestamp when we start this specific upscale
+        self.last_interaction_time = time.time()
+        
+        # Create a future for this upscale
+        self.upscale_futures[variant] = asyncio.Future()
+        
+        try:
+            # Send the upscale interaction
+            try:
+                if not await self._send_button_interaction(grid_message_id, custom_id):
+                    return UpscaleResult(
+                        success=False,
+                        variant=variant,
+                        error="Failed to send upscale interaction"
+                    )
+            except MidjourneyError as e:
+                return UpscaleResult(
+                    success=False,
+                    variant=variant,
+                    error=f"Interaction error: {str(e)}"
+                )
+                
+            # Start parallel detection approaches
+            # 1. WebSocket approach - wait for the upscale event
+            websocket_task = asyncio.create_task(
+                asyncio.wait_for(self.upscale_futures[variant], timeout=30)
+            )
+            
+            # 2. REST API polling approach - for fallback
+            rest_task = asyncio.create_task(self._fallback_get_upscale_result(variant))
+            
+            # Wait for either approach to succeed
+            done, pending = await asyncio.wait(
+                [websocket_task, rest_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Cancel any pending tasks
+            for task in pending:
+                task.cancel()
+            
+            # Process results
+            image_url = None
+            for task in done:
+                try:
+                    result = await task
+                    if result:
+                        image_url = result
+                        break
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout in upscale detection task for U{variant}")
+                except Exception as e:
+                    logger.error(f"Error in upscale detection task: {e}")
+            
+            if image_url:
+                return UpscaleResult(
+                    success=True,
+                    variant=variant,
+                    image_url=image_url
+                )
+            else:
+                # One more attempt with the original fallback as last resort
+                try:
+                    image_url = await self._fallback_get_upscale_result(variant)
+                    if image_url:
+                        return UpscaleResult(
+                            success=True,
+                            variant=variant,
+                            image_url=image_url
+                        )
+                    else:
+                        return UpscaleResult(
+                            success=False,
+                            variant=variant,
+                            error="Failed to detect upscale completion"
+                        )
+                except MidjourneyError as e:
+                    return UpscaleResult(
+                        success=False,
+                        variant=variant,
+                        error=f"Fallback error: {str(e)}"
+                    )
+        except Exception as e:
+            logger.error(f"Error in upscale process: {e}")
+            return UpscaleResult(
+                success=False,
+                variant=variant,
+                error=f"Exception during upscale: {str(e)}"
+            )
+        finally:
+            # Clear the future
+            if variant in self.upscale_futures:
+                if not self.upscale_futures[variant].done():
+                    self.upscale_futures[variant].cancel()
+                del self.upscale_futures[variant]
+            
+            # Reset tracking
+            self.current_upscale_variant = None
+
+    async def upscale_all_variants(self, grid_message_id: str) -> List[UpscaleResult]:
+        """
+        Upscale all 4 variants from a grid with improved reliability
+        
+        Args:
+            grid_message_id: The message ID of the grid to upscale
+            
+        Returns:
+            List[UpscaleResult]: List of upscale results for each variant
+            
+        Raises:
+            MidjourneyError: On serious errors that affect all variants
+        """
+        results = []
+        
+        # Make sure we're connected to bot gateway
+        if not self.bot_gateway.connected.is_set():
+            logger.warning("Bot gateway not connected, reconnecting...")
+            if not await self.bot_gateway.connect():
+                error_msg = "Failed to connect bot gateway"
+                raise MidjourneyError(error_msg)
+        
+        # Get message details using bot token
+        try:
+            message_data = await self._get_message_details(grid_message_id)
+            if not message_data:
+                error_msg = "Failed to get message details for grid"
+                raise MidjourneyError(error_msg)
+        except MidjourneyError as e:
+            # Pass through errors that affect all variants
+            raise e
+        
+        # Extract all button custom_ids
+        custom_ids = {}
+        for i in range(1, 5):  # 1-4 for U1-U4
+            try:
+                custom_id = await self._extract_button_custom_id(message_data, i)
+                if custom_id:
+                    custom_ids[i] = custom_id
+            except Exception as e:
+                logger.error(f"Error extracting button U{i}: {e}")
+        
+        if not custom_ids:
+            error_msg = "Failed to extract any button custom_ids"
+            raise MidjourneyError(error_msg)
+        
+        # Track which messages have been claimed by which variants
+        self.matched_message_ids = set()
+        
+        # Upscale each variant
+        for variant, custom_id in custom_ids.items():
+            logger.info(f"Upscaling variant U{variant}...")
+            
+            # Track which variant we're currently upscaling
+            self.current_upscale_variant = variant
+            
+            # Store the timestamp when we start this specific upscale
+            self.last_interaction_time = time.time()
+            
+            # Create a future for this upscale
+            self.upscale_futures[variant] = asyncio.Future()
+            
+            try:
+                # Send the upscale interaction
+                try:
+                    if not await self._send_button_interaction(grid_message_id, custom_id):
+                        results.append(UpscaleResult(
+                            success=False,
+                            variant=variant,
+                            error="Failed to send upscale interaction"
+                        ))
+                        continue
+                except MidjourneyError as e:
+                    # Capture specific interaction error
+                    results.append(UpscaleResult(
+                        success=False,
+                        variant=variant,
+                        error=f"Interaction error: {str(e)}"
+                    ))
+                    continue
+                    
+                # Start parallel detection approaches
+                # 1. WebSocket approach - wait for the upscale event
+                websocket_task = asyncio.create_task(
+                    asyncio.wait_for(self.upscale_futures[variant], timeout=30)
+                )
+                
+                # 2. REST API polling approach - now including variant-specific timestamp
+                rest_task = asyncio.create_task(self._fallback_get_upscale_result(variant))
+                
+                # Wait for either approach to succeed
+                done, pending = await asyncio.wait(
+                    [websocket_task, rest_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # Cancel any pending tasks
+                for task in pending:
+                    task.cancel()
+                
+                # Process results
+                image_url = None
+                for task in done:
+                    try:
+                        result = await task
+                        if result:
+                            image_url = result
+                            break
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Timeout in upscale detection task for U{variant}")
+                    except Exception as e:
+                        logger.error(f"Error in upscale detection task: {e}")
+                
+                if image_url:
+                    results.append(UpscaleResult(
+                        success=True,
+                        variant=variant,
+                        image_url=image_url
+                    ))
+                else:
+                    # One more attempt with the original fallback as last resort
+                    try:
+                        image_url = await self._fallback_get_upscale_result(variant)
+                        if image_url:
+                            results.append(UpscaleResult(
+                                success=True,
+                                variant=variant,
+                                image_url=image_url
+                            ))
+                        else:
+                            results.append(UpscaleResult(
+                                success=False,
+                                variant=variant,
+                                error="Failed to detect upscale completion"
+                            ))
+                    except MidjourneyError as e:
+                        results.append(UpscaleResult(
+                            success=False,
+                            variant=variant,
+                            error=f"Fallback error: {str(e)}"
+                        ))
+            except Exception as e:
+                logger.error(f"Error in upscale process: {e}")
+                results.append(UpscaleResult(
+                    success=False,
+                    variant=variant,
+                    error=f"Exception during upscale: {str(e)}"
+                ))
+            finally:
+                # Clear the future
+                if variant in self.upscale_futures:
+                    if not self.upscale_futures[variant].done():
+                        self.upscale_futures[variant].cancel()
+                    del self.upscale_futures[variant]
+            
+            # Add a delay between upscales to ensure they don't interfere with each other
+            # This also helps with rate limiting
+            await asyncio.sleep(8)
+        
+        # Reset tracking
+        self.current_upscale_variant = None
+        
+        return results
+
+    async def _fallback_get_upscale_result(self, variant, start_time=None, grid_message_id=None) -> Optional[str]:
+        """
+        Fallback method to detect upscale completion using REST API polling.
+        
+        This improved implementation addresses the issue where upscales could be 
+        mistakenly matched from previous prompts instead of the current grid image.
+        
+        Args:
+            variant: The variant being upscaled (1-4)
+            start_time: Optional override for the time when the upscale started
+            grid_message_id: Optional reference to specific grid message ID
+            
+        Returns:
+            Optional[str]: URL of the upscaled image if found, or None
+        """
+        # Use provided start time or the last interaction time
+        if start_time is None:
+            start_time = self.last_interaction_time
+        
+        # If we don't have a start time, use current time
+        if start_time == 0:
+            start_time = time.time()
+        
+        # Convert to timestamp for comparison
+        start_timestamp = datetime.fromtimestamp(start_time).isoformat()
+        
+        # Use provided grid_message_id or the one from the current operation
+        current_grid_id = grid_message_id or getattr(self, 'current_grid_message_id', None)
+        
+        logger.info(f"Using fallback method to detect U{variant} completion after {start_timestamp}")
+        if current_grid_id:
+            logger.info(f"Looking for upscales related to grid message ID: {current_grid_id}")
+            
+        # Keep track of processed message IDs to avoid duplicates
+        processed_msg_ids = set()
+        
+        # Get prompt from current grid message if available
+        grid_prompt = None
+        if current_grid_id:
+            try:
+                grid_message = await self._get_message_details(current_grid_id)
+                if grid_message and "**" in grid_message.get("content", ""):
+                    content_parts = grid_message.get("content", "").split("**")
+                    if len(content_parts) >= 3:
+                        grid_prompt = content_parts[1].strip().lower()
+                        logger.info(f"Extracted grid prompt for correlation: {grid_prompt}")
+            except Exception as e:
+                logger.error(f"Error extracting grid prompt: {e}")
+        
+        # Make up to 30 attempts (with sleep between)
+        for attempt in range(1, 31):
+            # Get recent messages, limiting to 25 at a time
+            messages = await self._get_recent_messages(limit=25)
+            if not messages:
+                logger.error("Failed to get messages for upscale detection")
+                await asyncio.sleep(1)
+                continue
+            
+            # Filter for valid upscale messages
+            valid_upscales = []
+            
+            for msg in messages:
+                msg_id = msg.get("id")
+                
+                # Skip already processed messages (across attempts)
+                if msg_id in processed_msg_ids or msg_id in self.matched_message_ids:
+                    continue
+                
+                # Add to processed set
+                processed_msg_ids.add(msg_id)
+                
+                # Check for valid upscale indicators
+                content = msg.get("content", "").lower()
+                is_upscale = False
+                
+                upscale_indicators = [
+                    f"image #{variant}",
+                    f"variant {variant}",
+                    f"u{variant}",
+                    f"upscaled (u{variant})"
+                ]
+                
+                if any(indicator in content for indicator in upscale_indicators):
+                    is_upscale = True
+                
+                # Skip if not an upscale message for our variant
+                if not is_upscale:
+                    continue
+                
+                # Check timestamp if available
+                msg_time = msg.get("timestamp", "").replace("Z", "+00:00")
+                if msg_time and msg_time < start_timestamp:
+                    # This upscale message is from before we started the upscale
+                    logger.debug(f"Skipping old upscale message from {msg_time}")
+                    continue
+                
+                # Check prompt matching with current generation or grid prompt
+                matched_prompt = False
+                
+                # Check against current generation prompt if available
+                if self.current_generation_prompt and "**" in msg.get("content", ""):
+                    # Extract text between ** if present
+                    content_parts = msg.get("content", "").split("**")
+                    if len(content_parts) >= 3:
+                        msg_prompt = content_parts[1].strip().lower()
+                        current_prompt_lower = self.current_generation_prompt.lower()
+                        
+                        # Check if prompts are similar (using containment in either direction)
+                        if (current_prompt_lower in msg_prompt or 
+                            msg_prompt in current_prompt_lower or
+                            self._prompts_are_similar(current_prompt_lower, msg_prompt)):
+                            matched_prompt = True
+                            logger.debug(f"Prompt matched with current generation: {msg_prompt}")
+                
+                # If we didn't match with current generation prompt, try grid prompt
+                if not matched_prompt and grid_prompt and "**" in msg.get("content", ""):
+                    content_parts = msg.get("content", "").split("**")
+                    if len(content_parts) >= 3:
+                        msg_prompt = content_parts[1].strip().lower()
+                        
+                        # Check if prompts are similar
+                        if (grid_prompt in msg_prompt or 
+                            msg_prompt in grid_prompt or
+                            self._prompts_are_similar(grid_prompt, msg_prompt)):
+                            matched_prompt = True
+                            logger.debug(f"Prompt matched with grid message: {msg_prompt}")
+                
+                # Skip if we have prompt information but didn't find a match
+                if (self.current_generation_prompt or grid_prompt) and not matched_prompt:
+                    logger.debug(f"Skipping message with non-matching prompt")
+                    continue
+                
+                # Message passed all checks - if it has an attachment, add to valid upscales
+                if msg.get("attachments"):
+                    # Store grid message reference in upscale metadata
+                    msg["grid_message_id"] = current_grid_id
+                    msg["upscale_variant"] = variant
+                    valid_upscales.append(msg)
+                    # Track this message ID as matched to avoid duplicate processing
+                    self.matched_message_ids.add(msg_id)
+            
+            # Sort by timestamp (newest first)
+            valid_upscales.sort(key=lambda m: m.get("timestamp", ""), reverse=True)
+            
+            # Return the URL from the most recent valid message
+            if valid_upscales and valid_upscales[0].get("attachments"):
+                msg = valid_upscales[0]
+                logger.info(f"Detected U{variant} completion via fallback: {msg.get('id')}")
+                
+                # Store this upscale's reference to its parent grid
+                if hasattr(self, 'upscale_grid_mapping') and current_grid_id:
+                    if not isinstance(self.upscale_grid_mapping, dict):
+                        self.upscale_grid_mapping = {}
+                    self.upscale_grid_mapping[msg.get('id')] = {
+                        "grid_message_id": current_grid_id,
+                        "variant": variant,
+                        "timestamp": time.time()
+                    }
+                
+                return valid_upscales[0]["attachments"][0]["url"]
+            
+            # Log progress during attempts
+            if attempt % 5 == 0:
+                logger.info(f"Still waiting for U{variant} upscale completion (attempt {attempt}/30)...")
+            
+            # Sleep before next attempt
+            await asyncio.sleep(2)
+        
+        logger.error(f"Failed to detect U{variant} completion after 30 attempts")
+        return None
+    
+    def _prompts_are_similar(self, prompt1: str, prompt2: str) -> bool:
+        """
+        Determine if two prompts are similar enough to be considered a match.
+        This handles cases where Discord truncates or modifies the prompt text.
+        
+        Args:
+            prompt1: First prompt text
+            prompt2: Second prompt text
+            
+        Returns:
+            bool: True if prompts are similar, False otherwise
+        """
+        # Normalize both prompts (remove parameters, extra spaces)
+        def normalize_prompt(p):
+            # Remove common parameters
+            p = re.sub(r'--[a-z]+\s+[\w:.]+', '', p)
+            # Remove multiple spaces
+            p = re.sub(r'\s+', ' ', p)
+            # Remove common punctuation
+            p = re.sub(r'[,.\'"!?()]', '', p)
+            return p.strip().lower()
+        
+        norm1 = normalize_prompt(prompt1)
+        norm2 = normalize_prompt(prompt2)
+        
+        # Simple case: one contains the other
+        if norm1 in norm2 or norm2 in norm1:
+            return True
+            
+        # Check for word overlap (at least 60% words in common)
+        words1 = set(norm1.split())
+        words2 = set(norm2.split())
+        
+        if not words1 or not words2:
+            return False
+            
+        common_words = words1.intersection(words2)
+        overlap_ratio1 = len(common_words) / len(words1)
+        overlap_ratio2 = len(common_words) / len(words2)
+        
+        # Consider similar if either prompt has high overlap
+        return overlap_ratio1 >= 0.6 or overlap_ratio2 >= 0.6
+
+    async def _send_slash_command(self, command: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Send a Discord slash command.
+        
+        Args:
+            command: A dictionary containing the command data
+            
+        Returns:
+            Dict containing the response, or None on error
+            
+        Raises:
+            MidjourneyError: On API errors
+        """
+        if not self.user_gateway.session_id:
+            logger.error("No session ID available, cannot send slash command")
+            raise InvalidRequestError("No session ID available")
+            
+        # Make sure user gateway is connected
+        if not self.user_gateway.connected.is_set():
+            logger.warning("User gateway not connected, reconnecting...")
+            if not await self.user_gateway.connect():
+                raise MidjourneyError("Failed to connect to user gateway")
+                
+        # Prepare the payload
+        payload = {
+            "type": 2,  # APPLICATION_COMMAND
+            "application_id": MIDJOURNEY_APP_ID,
+            "guild_id": self.guild_id,
+            "channel_id": self.channel_id,
+            "session_id": self.user_gateway.session_id,
+            "data": command
+        }
+        
+        url = f"{DISCORD_API_URL}/interactions"
+        endpoint = "interactions"
+        
+        try:
+            # Define the request function for the rate limiter
+            async def send_request():
+                # Apply rate limiting
+                await self.rate_limiter.wait(endpoint)
+                
+                # Record interaction time
+                self.last_interaction_time = time.time()
+
+                # Debug log the actual payload being sent
+                logger.debug(f"Sending interaction payload to {url}: {json.dumps(payload, indent=2)}")
+
+                # Use synchronous requests library for simplicity and reliability
+                response = requests.post(url, headers=self.headers, json=payload)
+                
+                # Update rate limits based on headers
+                if 'X-RateLimit-Remaining' in response.headers:
+                    self.rate_limiter.update_rate_limits(endpoint, response.headers)
+                
+                if 200 <= response.status_code < 300:
+                    logger.info(f"Interaction POST successful. Status: {response.status_code}")
+                    
+                    # Parse response - for Discord interactions, 204 No Content is usually success
+                    if response.status_code == 204:
+                        return {"status": response.status_code, "text_response": "No Content"}
+                    
+                    # If there's content, try to parse it as JSON
+                    if response.text and 'application/json' in response.headers.get('Content-Type', ''):
+                        try:
+                            return response.json()
+                        except ValueError:
+                            logger.warning(f"Response was not valid JSON, despite Content-Type. Status: {response.status_code}")
+                            return {"status": response.status_code, "text_response": response.text}
+                    else:
+                        return {"status": response.status_code, "text_response": response.text}
+                else:
+                    logger.error(f"Error sending interaction: {response.status_code} - {response.text[:500]}")
+                    
+                    # Check for authorization issues
+                    if response.status_code == 401:
+                        raise MidjourneyError(f"Authentication failed - invalid Discord token")
+                    elif response.status_code == 403:
+                        raise MidjourneyError(f"Permission denied - check channel/guild access")
+                    elif response.status_code == 404:
+                        raise MidjourneyError(f"Resource not found - check channel/guild IDs")
+                    
+                    # Store last error details
+                    self.last_error = {"status_code": response.status_code, "details": response.text[:500]}
+                    return None
+            
+            # Send the request with retry logic
+            response = await self.rate_limiter.with_retry(
+                send_request,
+                max_retries=3,
+                retry_status_codes=[429, 500, 502, 503, 504]
+            )
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error sending slash command: {e}")
+            raise MidjourneyError(f"Failed to send slash command: {str(e)}")
+    
+    async def _send_imagine_command(self, prompt: str) -> Optional[Dict[str, Any]]:
+        """
+        Send a Midjourney /imagine command for a specific prompt.
+        
+        Args:
+            prompt: The prompt to send to Midjourney
+            
+        Returns:
+            Dict containing the response, or None on error
+            
+        Raises:
+            MidjourneyError: On API errors
+        """
+        # Prepare the command data
+        command = {
+            "version": "1237876415471554623",
+            "id": "938956540159881230",  # Midjourney imagine command ID
+            "name": "imagine",
+            "type": 1,
+            "options": [
+                {
+                    "type": 3,
+                    "name": "prompt",
+                    "value": prompt
+                }
+            ]
+        }
+        
+        try:
+            # Log the command being sent
+            logger.info(f"Sending /imagine command with prompt: {prompt}")
+            
+            # Send the command to Discord
+            response = await self._send_slash_command(command)
+            
+            # Check if response is successful - for slash commands, often 204 No Content is success
+            if response:
+                status = response.get("status", 0)
+                if 200 <= status < 300:
+                    logger.info(f"Successfully sent /imagine command")
+                    return response
+                else:
+                    logger.error(f"Error response from /imagine command: {response}")
+            
+            # If we get here, something went wrong
+            logger.error(f"Failed to send /imagine command")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error sending imagine command: {e}")
+            return None
+
+    async def close(self):
+        """
+        Close the client connections and clean up resources
+        
+        Returns:
+            None
+        """
+        # Close user gateway
+        if hasattr(self, 'user_gateway'):
+            try:
+                await self.user_gateway.close()
+            except Exception as e:
+                logger.error(f"Error closing user gateway: {e}")
+        
+        # Close bot gateway
+        if hasattr(self, 'bot_gateway'):
+            try:
+                await self.bot_gateway.close()
+            except Exception as e:
+                logger.error(f"Error closing bot gateway: {e}")
+        
+        logger.debug("MidjourneyClient connections closed")
+
+    async def _get_message_details(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the details of a specific message
+        
+        Args:
+            message_id: The message ID to get details for
+            
+        Returns:
+            Dict containing the message details, or None if not found
+            
+        Raises:
+            MidjourneyError: On API errors
+        """
+        url = f"{DISCORD_API_URL}/channels/{self.channel_id}/messages/{message_id}"
+        
+        try:
+            # Apply rate limiting
+            await self.rate_limiter.wait(f"channels/{self.channel_id}/messages")
+            
+            # Use requests for simplicity
+            response = requests.get(url, headers=self.bot_headers)
+            
+            if response.status_code == 200:
+                message_data = response.json()
+                # Log important parts of the message for debugging
+                logger.info(f"Message {message_id} details:")
+                logger.info(f"  Content: {message_data.get('content', '')[:100]}...")
+                logger.info(f"  Author: {message_data.get('author', {}).get('username', 'Unknown')}")
+                logger.info(f"  Attachments: {len(message_data.get('attachments', []))}")
+                logger.info(f"  Has Components: {'components' in message_data}")
+                if 'components' in message_data:
+                    logger.info(f"  Component Rows: {len(message_data['components'])}")
+                    for i, row in enumerate(message_data['components']):
+                        if 'components' in row:
+                            logger.info(f"    Row {i} Components: {len(row['components'])}")
+                            for j, comp in enumerate(row['components']):
+                                comp_type = comp.get('type')
+                                comp_label = comp.get('label', 'No Label')
+                                logger.info(f"      Component {j}: Type={comp_type}, Label={comp_label}")
+                return message_data
+            elif response.status_code == 404:
+                logger.error(f"Message not found: {message_id}")
+                return None
+            else:
+                logger.error(f"Error getting message details: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"Error getting message details: {e}")
+            return None
+
+    async def _extract_button_custom_id(self, message_data: Dict[str, Any], variant: int) -> Optional[str]:
+        """
+        Extract the custom_id for a specific upscale button variant
+        
+        Args:
+            message_data: Message data from _get_message_details
+            variant: Variant number (1-4)
+            
+        Returns:
+            str: The custom_id for the button, or None if not found
+        """
+        try:
+            # Check if the message has components (buttons)
+            if 'components' not in message_data:
+                logger.error("Message has no components")
+                return None
+                
+            # Define possible button labels for the target variant
+            button_labels = [
+                f"U{variant}",  # Standard format: U1, U2, etc.
+                f"Upscale {variant}",  # Alternative format 
+                f"Upscale ({variant})",  # Another possible format
+                f"Variation {variant}",  # Another format
+                f"{variant}"  # Just the number
+            ]
+            
+            logger.info(f"Looking for upscale button for variant {variant} with possible labels: {button_labels}")
+            
+            # Look through all component rows
+            for row in message_data['components']:
+                if 'components' not in row:
+                    continue
+                    
+                # Look through all components in this row
+                for component in row['components']:
+                    component_label = component.get('label', '')
+                    component_type = component.get('type')
+                    
+                    # Log component details for debugging
+                    logger.debug(f"Checking component: type={component_type}, label='{component_label}'")
+                    
+                    # Check if this is a button
+                    if component_type == 2:
+                        # Try exact matches first
+                        if component_label in button_labels:
+                            custom_id = component.get('custom_id')
+                            logger.info(f"Found exact match for variant {variant}: label='{component_label}', custom_id={custom_id}")
+                            return custom_id
+                        
+                        # Try partial matches - some buttons might have extra text
+                        for label in button_labels:
+                            if label in component_label:
+                                custom_id = component.get('custom_id')
+                                logger.info(f"Found partial match for variant {variant}: button_label='{component_label}', match_pattern='{label}', custom_id={custom_id}")
+                                return custom_id
+            
+            logger.error(f"No upscale button found for variant {variant}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting button custom_id: {e}")
+            return None

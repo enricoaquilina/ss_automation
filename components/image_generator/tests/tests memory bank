@@ -1,0 +1,55 @@
+authenticate with discord gateway
+send slash commands
+listen for mesages using websockets or polling
+upsclae message images
+save upscaled images to gridfs
+downloads them to local dir in specific dir (components/image_generator/tests/test_output)
+    make sure folder is named in this format ex. 20250510_081214
+it also should download metadata to generation:
+    prompt named ex. prompt_20250509_175851 
+    and upscales
+    add metadata for generation and upscales named appropriately
+
+
+verify upscale image correlation
+    ensure upscales match their parent grid image
+    include reference to grid_message_id in upscale metadata
+    track message timestamps to match newest upscales to current prompt
+    implement tracking mechanism to prevent downloading previous/unrelated upscales
+    use content matching to verify upscale variant belongs to current generation
+
+auth discord gateway (websockets)
+send requests using interactions api
+listen for messgaes (generation/upscales)
+add test logs in the end
+
+
+use diff aspect ratios (1:1, 4:5, 16:9)
+use diff versions (--v 6.1, --v 7.0, --niji 6)
+use various prompts
+
+verify live test credentials
+    ensure DISCORD_USER_TOKEN and DISCORD_BOT_TOKEN are valid before running extensive live tests
+    provide clear error messages or skip tests gracefully if auth fails
+
+-------------------------------
+
+Midjourney Live Test Issues and Mitigations:
+
+1. Content Moderation Handling:
+   - Pre-moderation filters may block test prompts even with innocuous content
+   - Design tests to handle and recover from moderation errors
+   - Use family-friendly test prompts or include explicit error handling for moderation cases
+   - Consider testing moderation detection as its own test case
+
+2. Async Fixture Configuration:
+   - Use @pytest_asyncio.fixture instead of @pytest.fixture for async fixtures
+   - Ensure proper setup/teardown in async fixtures
+   - When in strict mode, async fixtures require correct async annotations
+   - Fix AttributeError: 'async_generator' object has no attribute X by using 'async with' pattern
+
+3. Mock vs. Live Testing:
+   - Default to mock mode for CI/CD and regular development
+   - Reserve live tests for final validation to conserve Midjourney credits
+   - Expect occasional failures in live tests due to external factors
+   - Make live tests optional with clear skip mechanisms when credentials aren't available
